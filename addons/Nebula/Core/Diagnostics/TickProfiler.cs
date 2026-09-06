@@ -188,6 +188,13 @@ namespace Nebula.Diagnostics
             /// sent" x peers - the latter is what the pre-ring pending set cost.
             /// </summary>
             AckNodesVisited,
+            /// <summary>Interest resync sections committed (phase 3), summed over peers.</summary>
+            ResyncSections,
+            /// <summary>
+            /// Wire bytes those sections cost INCLUDING framing (node header, group header) -
+            /// the only attribution of resync cost; PayloadCensus never sees these bytes.
+            /// </summary>
+            ResyncBytes,
             Count,
         }
 
@@ -197,6 +204,7 @@ namespace Nebula.Diagnostics
             "pk_chosen_age_sum", "pk_measured",
             "memo_hit", "memo_miss", "memo_slow", "memo_overflow",
             "ack_nodes_visited",
+            "resync_sections", "resync_bytes",
         };
         private const int CounterCount = (int)Counter.Count;
 

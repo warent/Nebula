@@ -132,6 +132,39 @@ public class PeerAckRingTests
         Assert.Equal(new[] { wrapTick }, recentRec.AckedTicks);
     }
 
+    // 2b. A node whose ONLY section was the interest resync byte is acked through the ring
+    //     like any other: the resync serializer's resend-until-acked commit depends on it.
+    [NebulaUnitTest]
+    public void Ack_ReachesResyncOnlySection()
+    {
+        using var f = new Fixture();
+        var node = new NetNode();
+        node.Network.CurrentWorld = f.World;
+        node.Network.InterestLayers[f.PeerId] = 1;
+        f.Nodes.Add(node);
+        var resync = new InterestResyncSerializer(node.Network);
+        node.SetSerializersForTests([resync]);
+        f.World.SetClientSpawnState(node.Network.NetId, f.Peer, WorldRunner.ClientSpawnState.Spawned);
+
+        // Interest lost: find the stagger slot, export + commit there (what phase 3 does).
+        node.Network.InterestLayers[f.PeerId] = 0;
+        int tick = 10;
+        var buf = new NetBuffer(8, usePool: false);
+        while (true)
+        {
+            f.World.CurrentTick = tick;
+            buf.Reset();
+            if (resync.Export(f.World, f.Peer, buf, int.MaxValue) == ExportResult.Written) break;
+            tick++;
+        }
+        resync.CommitExport(f.World, f.Peer, tick);
+        f.World.RegisterSentNodeForTests(f.PeerId, tick, node.Network);
+        Assert.Equal(1, resync.PendingPeersForTests);
+
+        f.World.PeerAcknowledge(f.Peer, tick);
+        Assert.Equal(0, resync.PendingPeersForTests);
+    }
+
     // 3. A node freed between commit and ack is skipped, not acked into a dead serializer.
     [NebulaUnitTest]
     public void Ack_SkipsNodeMarkedForDeletion()
