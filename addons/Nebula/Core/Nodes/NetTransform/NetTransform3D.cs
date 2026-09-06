@@ -90,7 +90,14 @@ namespace Nebula.Utility.Nodes
         /// <summary>
         /// Networked position with interpolation for non-owned and prediction for owned entities.
         /// </summary>
-        [NetProperty(Interpolate = true, InterpolateSpeed = 1f, Predicted = true, NotifyOnChange = true)]
+        /// <remarks>
+        /// Replicated on a 1 cm grid (<c>Quantize = 0.01f</c>): the generic transform
+        /// default. A moving delta packs into one uint32 while the per-tick displacement stays
+        /// under 5.11 units per axis (~150 u/s at 30 TPS); faster movers fall back to varints
+        /// at no worse than the old half-float cost. A project wanting coarser positions
+        /// raises the step on its own subclass or property.
+        /// </remarks>
+        [NetProperty(Interpolate = true, InterpolateSpeed = 1f, Predicted = true, NotifyOnChange = true, Quantize = 0.01f)]
         public Vector3 NetPosition { get; set; }
 
         /// <summary>
@@ -103,12 +110,19 @@ namespace Nebula.Utility.Nodes
         /// <summary>
         /// Networked rotation with interpolation for non-owned and prediction for owned entities.
         /// </summary>
-        [NetProperty(Interpolate = true, InterpolateSpeed = 15f, Predicted = true, NotifyOnChange = true)]
+        /// <remarks>
+        /// Replicated as smallest-three in a uint32 (<c>Quantize = 0.002f</c> resolves to 10
+        /// bits per component, the cap): 4 bytes instead of 6, worst-case angular error
+        /// ~0.0055 rad (QuantizedCodec.MaxError).
+        /// </remarks>
+        [NetProperty(Interpolate = true, InterpolateSpeed = 15f, Predicted = true, NotifyOnChange = true, Quantize = 0.002f)]
         public Quaternion NetRotation { get; set; } = Quaternion.Identity;
 
         /// <summary>
         /// Tolerance for rotation misprediction detection.
         /// Set this from parent nodes that use NetTransform3D via composition.
+        /// The default sits ~9x above the wire's worst-case rotation error (see NetRotation);
+        /// an owner that lowers it below ~0.006 rad would reconcile on quantization noise.
         /// </summary>
         [Export]
         public float NetRotationPredictionTolerance { get; set; } = 0.05f;

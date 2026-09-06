@@ -242,6 +242,22 @@ namespace Nebula.Serialization
             return new Quaternion(x, y, z, w);
         }
 
+        /// <summary>Inverse of <see cref="NetWriter.WriteZigZagVarInt"/>.</summary>
+        public static int ReadZigZagVarInt(NetBuffer buffer)
+        {
+            uint zig = 0;
+            int shift = 0;
+            while (true)
+            {
+                byte b = ReadByte(buffer);
+                zig |= (uint)(b & 0x7F) << shift;
+                if ((b & 0x80) == 0) break;
+                shift += 7;
+                if (shift > 28) throw new InvalidOperationException("ZigZag varint longer than 5 bytes");
+            }
+            return (int)(zig >> 1) ^ -(int)(zig & 1);
+        }
+
         #endregion
 
         #region Arrays and Strings

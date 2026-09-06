@@ -240,6 +240,23 @@ namespace Nebula.Serialization
             buffer.AdvanceWrite(6);
         }
 
+        /// <summary>
+        /// Zigzag-mapped LEB128 varint: small magnitudes of either sign cost one byte, and any
+        /// int fits in five. Used for quantized property step counts (see QuantizedCodec);
+        /// nothing else in the protocol uses a varint, so this is the only place the shape
+        /// needs to be agreed on.
+        /// </summary>
+        public static void WriteZigZagVarInt(NetBuffer buffer, int value)
+        {
+            uint zig = (uint)((value << 1) ^ (value >> 31));
+            while (zig >= 0x80)
+            {
+                WriteByte(buffer, (byte)(zig | 0x80));
+                zig >>= 7;
+            }
+            WriteByte(buffer, (byte)zig);
+        }
+
         #endregion
 
         #region Arrays and Strings
