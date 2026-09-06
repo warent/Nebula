@@ -219,6 +219,32 @@ namespace Nebula.Serialization.Serializers
         /// <summary>Pre-cached: chunk budget handed to object/custom-type serializers.</summary>
         private readonly int[] _propChunkBudget;
 
+        // ─── Wire quantization ([NetProperty(Quantize = step)]) ───
+        //
+        // Resolved once from the protocol table like IntWidth, and read by both the writer
+        // and the reader so the two can never disagree on a property's encoding. See
+        // QuantizedCodec for the wire forms and the exactness contract.
+        /// <summary>Grid step per property; 0 = not quantized (float/half encoding).</summary>
+        private readonly float[] _propQuantStep;
+        /// <summary>Smallest-three bits per component for quantized quaternions; 0 otherwise.</summary>
+        private readonly byte[] _propQuantBits;
+        /// <summary>Vector3 sent as an octahedral unit direction.</summary>
+        private readonly bool[] _propUnitVector;
+        /// <summary>Integer code count of a quantized grid property (0 for quaternions).</summary>
+        private readonly byte[] _propQuantComponents;
+        /// <summary>Bit per quantized property, for the dirty filter's fast skip.</summary>
+        private long _quantizedMask;
+        /// <summary>
+        /// Server-side dead-band state: the last grid codes that PASSED the dirty filter, per
+        /// property (MaxComponents slots each; a quaternion uses one for its packed word).
+        /// Compared against the last passed value, never the previous tick, so a slowly
+        /// creeping value accumulates until it crosses a cell instead of being filtered
+        /// forever. Unset (bit clear in <see cref="_gridSeededMask"/>) means "pass", so the
+        /// first dirty tick after a spawn or teleport always ships.
+        /// </summary>
+        private int[] _lastGridCodes;
+        private long _gridSeededMask;
+
         /// <summary>Pre-cached size in bytes of the property presence mask.</summary>
         private readonly int _byteCount;
 
@@ -323,6 +349,10 @@ namespace Nebula.Serialization.Serializers
                 _propInterestRequired = Array.Empty<long>();
                 _propIntWidth = Array.Empty<IntWidth>();
                 _propChunkBudget = Array.Empty<int>();
+                _propQuantStep = Array.Empty<float>();
+                _propQuantBits = Array.Empty<byte>();
+                _propUnitVector = Array.Empty<bool>();
+                _propQuantComponents = Array.Empty<byte>();
                 _propertiesUpdated = Array.Empty<byte>();
                 _actualMask = Array.Empty<byte>();
                 _dirtyOnlyMask = Array.Empty<byte>();
@@ -366,10 +396,15 @@ namespace Nebula.Serialization.Serializers
             _propInterestRequired = new long[_propertyCount];
             _propIntWidth = new IntWidth[_propertyCount];
             _propChunkBudget = new int[_propertyCount];
+            _propQuantStep = new float[_propertyCount];
+            _propQuantBits = new byte[_propertyCount];
+            _propUnitVector = new bool[_propertyCount];
+            _propQuantComponents = new byte[_propertyCount];
 
             for (int i = 0; i < _propertyCount; i++)
             {
                 var prop = Protocol.UnpackProperty(_cachedSceneFilePath, i);
+                ResolveQuantization(i, prop.VariantType, prop.Quantize, prop.UnitVector);
                 _propTypes[i] = prop.VariantType;
                 _propSupportsDelta[i] = SupportsDelta(prop.VariantType);
                 _propIsNodeRef[i] = prop.IsObjectProperty && Protocol.IsNodeReferenceClass(prop.ClassIndex);
@@ -557,6 +592,61 @@ namespace Nebula.Serialization.Serializers
                     // long, ulong, or an unrecognised subtype - the reader's default is Int64 too.
                     return IntWidth.Int64;
             }
+        }
+
+        /// <summary>
+        /// Fills the per-property quantization caches from the declared step. A step on a
+        /// type NEBULA010 rejects is ignored here (the generator already refused to build),
+        /// so the writer and reader can dispatch on <c>_propQuantStep &gt; 0</c> alone.
+        /// </summary>
+        private void ResolveQuantization(int propIndex, SerialVariantType type, float step, bool unitVector)
+        {
+            if (step <= 0f || !QuantizedCodec.IsQuantizable(type)) return;
+            _propQuantStep[propIndex] = step;
+            _propUnitVector[propIndex] = unitVector && type == SerialVariantType.Vector3;
+            _propQuantBits[propIndex] = type == SerialVariantType.Quaternion ? QuantizedCodec.ResolveQuatBits(step) : (byte)0;
+            _propQuantComponents[propIndex] = (byte)QuantizedCodec.ComponentCount(type, _propUnitVector[propIndex]);
+            _quantizedMask |= 1L << propIndex;
+            _lastGridCodes ??= new int[_propertyCount * QuantizedCodec.MaxComponents];
+        }
+
+        /// <summary>
+        /// Grid codes of a property's current value: the integers the wire carries. A
+        /// quaternion contributes its packed word as a single code.
+        /// </summary>
+        private void GridCodes(int propIndex, in PropertyCache value, Span<int> codes)
+        {
+            var type = _propTypes[propIndex];
+            if (type == SerialVariantType.Quaternion)
+            {
+                codes[0] = (int)QuantizedCodec.PackQuat(value.QuatValue, _propQuantBits[propIndex]);
+                return;
+            }
+            QuantizedCodec.Encode(in value, type, _propUnitVector[propIndex], _propQuantStep[propIndex], codes);
+        }
+
+        /// <summary>
+        /// The quantized dead-band: true when the property's current grid codes equal the
+        /// last codes that passed this filter, i.e. the change is invisible on the wire.
+        /// Records the codes when they differ (or on the first call), so the comparison is
+        /// always against the last SHIPPED cell.
+        /// </summary>
+        private bool GridUnchanged(int propIndex)
+        {
+            int count = _propTypes[propIndex] == SerialVariantType.Quaternion ? 1 : _propQuantComponents[propIndex];
+            Span<int> codes = stackalloc int[QuantizedCodec.MaxComponents];
+            GridCodes(propIndex, in network.CachedProperties[propIndex], codes);
+            int baseSlot = propIndex * QuantizedCodec.MaxComponents;
+            long bit = 1L << propIndex;
+            bool same = (_gridSeededMask & bit) != 0;
+            for (int k = 0; same && k < count; k++)
+            {
+                if (_lastGridCodes[baseSlot + k] != codes[k]) same = false;
+            }
+            if (same) return true;
+            for (int k = 0; k < count; k++) _lastGridCodes[baseSlot + k] = codes[k];
+            _gridSeededMask |= bit;
+            return false;
         }
 
         /// <summary>
@@ -884,7 +974,15 @@ namespace Nebula.Serialization.Serializers
         /// against a WorldRunner prepared with CreatePeerStateForTests (object properties
         /// need the Protocol serializer registry and must not be used here).
         /// </summary>
-        internal NetPropertiesSerializer(NetworkController _network, SerialVariantType[] propTypes)
+        /// <param name="intWidths">
+        /// Optional per-property integer width (Int props only; null = Int64 for all). Encoding
+        /// metadata the real ctor resolves from the protocol table is supplied here by the
+        /// test, so the reader and writer under test agree the same way they do in production.
+        /// </param>
+        /// <param name="quantizeSteps">Optional per-property grid step (0 = unquantized), as NetProperty.Quantize.</param>
+        /// <param name="unitVectors">Optional per-property UnitVector flag, as NetProperty.UnitVector.</param>
+        internal NetPropertiesSerializer(NetworkController _network, SerialVariantType[] propTypes, IntWidth[] intWidths = null,
+            float[] quantizeSteps = null, bool[] unitVectors = null)
         {
             network = _network;
             _cachedSceneFilePath = network.RawNode.SceneFilePath;
@@ -894,7 +992,10 @@ namespace Nebula.Serialization.Serializers
             _reservedMaskBytes = PresenceMask.ReservedBytes(_byteCount);
 
             _propTypes = propTypes;
+            // Mirrors the real ctor: without this, useDelta was false for every test and the
+            // delta/lossy write paths had no unit coverage at all.
             _propSupportsDelta = new bool[_propertyCount];
+            for (int i = 0; i < _propertyCount; i++) _propSupportsDelta[i] = SupportsDelta(propTypes[i]);
             _propIsNodeRef = new bool[_propertyCount];
             _propIsObject = new bool[_propertyCount];
             _propClassIndex = new int[_propertyCount];
@@ -904,8 +1005,23 @@ namespace Nebula.Serialization.Serializers
             // Visible on every interest layer, like a property with no [NetInterest].
             for (int i = 0; i < _propertyCount; i++) _propInterestMask[i] = -1L;
             _propInterestRequired = new long[_propertyCount];
-            _propIntWidth = new IntWidth[_propertyCount];
+            _propIntWidth = intWidths ?? new IntWidth[_propertyCount];
+            if (_propIntWidth.Length != _propertyCount)
+            {
+                throw new ArgumentException($"intWidths length {_propIntWidth.Length} != property count {_propertyCount}", nameof(intWidths));
+            }
             _propChunkBudget = new int[_propertyCount];
+            _propQuantStep = new float[_propertyCount];
+            _propQuantBits = new byte[_propertyCount];
+            _propUnitVector = new bool[_propertyCount];
+            _propQuantComponents = new byte[_propertyCount];
+            for (int i = 0; i < _propertyCount; i++)
+            {
+                ResolveQuantization(i,
+                    propTypes[i],
+                    quantizeSteps != null ? quantizeSteps[i] : 0f,
+                    unitVectors != null && unitVectors[i]);
+            }
 
             _propertiesUpdated = new byte[_byteCount];
             _actualMask = new byte[_byteCount];
@@ -988,6 +1104,22 @@ namespace Nebula.Serialization.Serializers
             if (_appliedRing == null) return false;
             ref var entry = ref _appliedRing[tick % SNAPSHOT_RING_SIZE];
             return entry.Values != null && entry.Tick == tick;
+        }
+
+        /// <summary>Test seam (client): the applied value recorded for a property at a tick.</summary>
+        internal PropertyCache AppliedValueForTests(Tick tick, int propIndex)
+        {
+            ref var entry = ref _appliedRing[tick % SNAPSHOT_RING_SIZE];
+            if (entry.Values == null || entry.Tick != tick) throw new InvalidOperationException($"no applied entry at tick {tick}");
+            return entry.Values[propIndex];
+        }
+
+        /// <summary>Test seam (server): the delta-ring value (canonical for quantized props) at a tick.</summary>
+        internal PropertyCache RingValueForTests(Tick tick, int propIndex)
+        {
+            ref var entry = ref _tickValueRing[tick % SNAPSHOT_RING_SIZE];
+            if (entry.Values == null || entry.Tick != tick) throw new InvalidOperationException($"no ring entry at tick {tick}");
+            return entry.Values[propIndex];
         }
 
         private Data Deserialize(NetBuffer buffer, Tick currentTick, out bool discarded)
@@ -1090,18 +1222,6 @@ namespace Nebula.Serialization.Serializers
 
                     var propertyIndex = propertyByteIndex * BitConstants.BitsInByte + propertyBit;
 
-                    var prop = Protocol.UnpackProperty(_cachedSceneFilePath, propertyIndex);
-                    if (string.IsNullOrEmpty(prop.Name))
-                    {
-                        continue;
-                    }
-
-                    // Skip IsObjectProperty (INetSerializable) - handled in Pass 2
-                    if (prop.IsObjectProperty)
-                    {
-                        continue;
-                    }
-
                     // Bounded by _propertyCount, not CachedProperties.Length: the latter is a
                     // fixed 64 regardless of how many properties this scene declares, so it
                     // would admit indices that have no entry in the pre-cached metadata arrays.
@@ -1110,33 +1230,43 @@ namespace Nebula.Serialization.Serializers
                         Debugger.Instance.Log(Debugger.DebugLevel.ERROR, $"[NetPropertiesSerializer.Deserialize] propertyIndex {propertyIndex} >= property count {_propertyCount}! Skipping property.");
                         continue;
                     }
+
+                    // Metadata comes from the constructor's pre-cached arrays, the same ones
+                    // the writer dispatches on (and the only ones the Protocol-free test
+                    // constructor fills), never from a per-property registry lookup here.
+                    // Skip IsObjectProperty (INetSerializable) - handled in Pass 2
+                    if (_propIsObject[propertyIndex])
+                    {
+                        continue;
+                    }
+                    var propType = _propTypes[propertyIndex];
                     ref var existingCache = ref network.CachedProperties[propertyIndex];
 
                     int propStartPos = buffer.ReadPosition;
                     var cache = new PropertyCache();
 
-                    if (prop.VariantType == SerialVariantType.Nil)
+                    if (propType == SerialVariantType.Nil)
                     {
-                        Debugger.Instance.Log(Debugger.DebugLevel.ERROR, $"Property {prop.NodePath}.{prop.Name} has VariantType.Nil, cannot deserialize");
+                        Debugger.Instance.Log(Debugger.DebugLevel.ERROR, $"Property {PropertyNameForLog(propertyIndex)} has VariantType.Nil, cannot deserialize");
                         continue;
                     }
 
                     // INetValue types with Object VariantType (like UUID) need special handling
                     // They're written with delta encoding wrapper (Absolute flag byte first) but use custom deserializer
-                    if (prop.VariantType == SerialVariantType.Object)
+                    if (propType == SerialVariantType.Object)
                     {
                         // Read the delta encoding flag byte (will always be Absolute for Object types since they don't support delta)
                         var flags = (DeltaEncodingFlags)NetReader.ReadByte(buffer);
                         if (flags != DeltaEncodingFlags.Absolute)
                         {
-                            Debugger.Instance.Log(Debugger.DebugLevel.ERROR, $"Expected Absolute encoding for INetValue Object type {prop.NodePath}.{prop.Name}, got {flags}");
+                            Debugger.Instance.Log(Debugger.DebugLevel.ERROR, $"Expected Absolute encoding for INetValue Object type {PropertyNameForLog(propertyIndex)}, got {flags}");
                         }
 
                         // Use the deserializer for the value type
-                        var deserializer = Protocol.GetDeserializer(prop.ClassIndex);
+                        var deserializer = Protocol.GetDeserializer(_propClassIndex[propertyIndex]);
                         if (deserializer == null)
                         {
-                            Debugger.Instance.Log(Debugger.DebugLevel.ERROR, $"No deserializer found for INetValue {prop.NodePath}.{prop.Name}");
+                            Debugger.Instance.Log(Debugger.DebugLevel.ERROR, $"No deserializer found for INetValue {PropertyNameForLog(propertyIndex)}");
                             continue;
                         }
                         var existingValue = existingCache.RefValue;
@@ -1148,19 +1278,18 @@ namespace Nebula.Serialization.Serializers
                         // Read the value, applying deltas against the baseline snapshot.
                         // With no baseline (absolute payload or discard mode) a scratch
                         // default is passed - deltas can't occur in a well-formed absolute
-                        // payload. The absolute path still needs the raw subtype string,
-                        // since NetReader.ReadAbsoluteValue is shared with other call sites.
+                        // payload.
                         if (baselineValues != null)
                         {
-                            ReadDeltaOrAbsolute(buffer, prop.VariantType, _propIntWidth[propertyIndex], prop.Metadata.TypeIdentifier, ref baselineValues[propertyIndex], ref cache);
+                            ReadDeltaOrAbsolute(buffer, propertyIndex, propType, _propIntWidth[propertyIndex], ref baselineValues[propertyIndex], ref cache);
                         }
                         else
                         {
-                            ReadDeltaOrAbsolute(buffer, prop.VariantType, _propIntWidth[propertyIndex], prop.Metadata.TypeIdentifier, ref noBaseline, ref cache);
+                            ReadDeltaOrAbsolute(buffer, propertyIndex, propType, _propIntWidth[propertyIndex], ref noBaseline, ref cache);
                         }
                     }
 
-                    if (TraceWire) Debugger.Instance.Log($"[Props.R] idx={propertyIndex} '{prop.NodePath}.{prop.Name}' type={prop.VariantType} bytes={buffer.ReadPosition - propStartPos} end={buffer.ReadPosition}");
+                    if (TraceWire) Debugger.Instance.Log($"[Props.R] idx={propertyIndex} '{PropertyNameForLog(propertyIndex)}' type={propType} bytes={buffer.ReadPosition - propStartPos} end={buffer.ReadPosition}");
 
                     if (!discardPayload)
                     {
@@ -1183,13 +1312,18 @@ namespace Nebula.Serialization.Serializers
 
                     var propertyIndex = propertyByteIndex * BitConstants.BitsInByte + propertyBit;
 
+                    // Only process IsObjectProperty (INetSerializable) in this pass; the
+                    // registry lookup is deferred until the bit is known to be one (the
+                    // Protocol-free test ctor has no registry entry to unpack).
+                    if (propertyIndex >= _propertyCount || !_propIsObject[propertyIndex])
+                    {
+                        continue;
+                    }
                     var prop = Protocol.UnpackProperty(_cachedSceneFilePath, propertyIndex);
                     if (string.IsNullOrEmpty(prop.Name))
                     {
                         continue;
                     }
-
-                    // Only process IsObjectProperty (INetSerializable) in this pass
                     if (!prop.IsObjectProperty)
                     {
                         continue;
@@ -1279,10 +1413,18 @@ namespace Nebula.Serialization.Serializers
         /// declared baseline tick), never against the running value.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static void ReadDeltaOrAbsolute(NetBuffer buffer, SerialVariantType type, IntWidth intWidth, string subtype, ref PropertyCache baseline, ref PropertyCache cache)
+        private void ReadDeltaOrAbsolute(NetBuffer buffer, int propIndex, SerialVariantType type, IntWidth intWidth, ref PropertyCache baseline, ref PropertyCache cache)
         {
             var flags = (DeltaEncodingFlags)NetReader.ReadByte(buffer);
             cache.Type = type;
+
+            // Quantized properties have their own forms for every flag value, decided by
+            // the protocol table, so this must come before the QuatCompressed shortcut.
+            if (_propQuantStep[propIndex] > 0f)
+            {
+                ReadQuantized(buffer, flags, propIndex, type, ref baseline, ref cache);
+                return;
+            }
 
             // Check for quaternion compressed encoding
             if ((flags & DeltaEncodingFlags.QuatCompressed) != 0)
@@ -1298,41 +1440,118 @@ namespace Nebula.Serialization.Serializers
             {
                 case DeltaEncodingFlags.Absolute:
                     // Full absolute value
-                    ReadAbsoluteValue(buffer, type, subtype, ref cache);
+                    ReadAbsoluteValue(buffer, type, intWidth, ref cache);
                     break;
 
                 case DeltaEncodingFlags.DeltaSmall:
                     // Small delta (half-float/short encoding)
-                    ReadSmallDelta(buffer, type, intWidth, subtype, ref baseline, ref cache);
+                    ReadSmallDelta(buffer, type, intWidth, ref baseline, ref cache);
                     break;
 
                 case DeltaEncodingFlags.DeltaFull:
                     // Full delta (same type as property)
-                    ReadFullDelta(buffer, type, intWidth, subtype, ref baseline, ref cache);
+                    ReadFullDelta(buffer, type, intWidth, ref baseline, ref cache);
                     break;
 
                 default:
                     Debugger.Instance.Log(Debugger.DebugLevel.ERROR, $"Unknown delta encoding flag: {flags}");
-                    ReadAbsoluteValue(buffer, type, subtype, ref cache);
+                    ReadAbsoluteValue(buffer, type, intWidth, ref cache);
                     break;
             }
         }
 
         /// <summary>
-        /// Reads an absolute property value (no delta).
-        /// Delegates to NetReader.ReadAbsoluteValue for reuse.
+        /// Mirror of the writer's quantized paths (WriteAbsolute / WriteDelta): a packed
+        /// quaternion word, or N grid codes absolute / as a small packed delta / as varint
+        /// deltas applied to Quantize(baseline). The stored value is Dequantize(codes),
+        /// which is exactly what the server's canonical ring holds for this tick.
+        /// </summary>
+        private void ReadQuantized(NetBuffer buffer, DeltaEncodingFlags flags, int propIndex, SerialVariantType type, ref PropertyCache baseline, ref PropertyCache cache)
+        {
+            if (type == SerialVariantType.Quaternion)
+            {
+                if ((flags & DeltaEncodingFlags.QuatCompressed) == 0)
+                {
+                    throw new InvalidOperationException($"quantized quaternion property {propIndex} arrived without QuatCompressed (flags={flags})");
+                }
+                cache.QuatValue = QuantizedCodec.UnpackQuat(NetReader.ReadUInt32(buffer), _propQuantBits[propIndex]);
+                return;
+            }
+
+            int count = _propQuantComponents[propIndex];
+            bool unit = _propUnitVector[propIndex];
+            float step = _propQuantStep[propIndex];
+            Span<int> codes = stackalloc int[QuantizedCodec.MaxComponents];
+            switch (flags & (DeltaEncodingFlags)0x7F)
+            {
+                case DeltaEncodingFlags.Absolute:
+                    QuantizedCodec.ReadCodes(buffer, codes, count);
+                    break;
+                case DeltaEncodingFlags.DeltaSmall:
+                case DeltaEncodingFlags.DeltaFull:
+                {
+                    Span<int> deltas = stackalloc int[QuantizedCodec.MaxComponents];
+                    if ((flags & (DeltaEncodingFlags)0x7F) == DeltaEncodingFlags.DeltaSmall)
+                        QuantizedCodec.ReadSmallDelta(buffer, deltas, count);
+                    else
+                        QuantizedCodec.ReadCodes(buffer, deltas, count);
+                    QuantizedCodec.Encode(in baseline, type, unit, step, codes);
+                    for (int k = 0; k < count; k++) codes[k] += deltas[k];
+                    break;
+                }
+                default:
+                    throw new InvalidOperationException($"unknown delta encoding flag {flags} on quantized property {propIndex}");
+            }
+            QuantizedCodec.Decode(codes, type, unit, step, ref cache);
+        }
+
+        /// <summary>Property name for a log line; the registry may not know a test scene.</summary>
+        private string PropertyNameForLog(int propIndex)
+            => Protocol.TryUnpackProperty(_cachedSceneFilePath, propIndex, out var prop) ? $"{prop.NodePath}.{prop.Name}" : $"#{propIndex}";
+
+        /// <summary>
+        /// Reads an absolute property value (no delta). Int properties read at the width the
+        /// constructor resolved (the same <see cref="IntWidth"/> WriteAbsoluteValue writes at),
+        /// so reader and writer share one source of truth; everything else delegates to
+        /// NetReader.ReadAbsoluteValue.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static void ReadAbsoluteValue(NetBuffer buffer, SerialVariantType type, string subtype, ref PropertyCache cache)
+        private static void ReadAbsoluteValue(NetBuffer buffer, SerialVariantType type, IntWidth intWidth, ref PropertyCache cache)
         {
-            NetReader.ReadAbsoluteValue(buffer, type, subtype, ref cache);
+            if (type != SerialVariantType.Int)
+            {
+                NetReader.ReadAbsoluteValue(buffer, type, null, ref cache);
+                return;
+            }
+            cache.LongValue = 0;
+            switch (intWidth)
+            {
+                case IntWidth.Byte:
+                    cache.ByteValue = NetReader.ReadByte(buffer);
+                    break;
+                case IntWidth.Int16:
+                    cache.IntValue = NetReader.ReadInt16(buffer);
+                    break;
+                case IntWidth.UInt16:
+                    cache.IntValue = NetReader.ReadUInt16(buffer);
+                    break;
+                case IntWidth.Int32:
+                    cache.IntValue = NetReader.ReadInt32(buffer);
+                    break;
+                case IntWidth.UInt32:
+                    cache.IntValue = (int)NetReader.ReadUInt32(buffer);
+                    break;
+                default:
+                    cache.LongValue = NetReader.ReadInt64(buffer);
+                    break;
+            }
         }
 
         /// <summary>
         /// Reads a small delta (half-float/short) and applies it to the baseline value.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static void ReadSmallDelta(NetBuffer buffer, SerialVariantType type, IntWidth intWidth, string subtype, ref PropertyCache baseline, ref PropertyCache cache)
+        private static void ReadSmallDelta(NetBuffer buffer, SerialVariantType type, IntWidth intWidth, ref PropertyCache baseline, ref PropertyCache cache)
         {
             switch (type)
             {
@@ -1379,7 +1598,7 @@ namespace Nebula.Serialization.Serializers
                 default:
                     // Fallback to absolute for unsupported small delta types
                     Debugger.Instance.Log(Debugger.DebugLevel.WARN, $"Small delta not supported for type {type}, reading absolute");
-                    ReadAbsoluteValue(buffer, type, subtype, ref cache);
+                    ReadAbsoluteValue(buffer, type, intWidth, ref cache);
                     break;
             }
         }
@@ -1388,7 +1607,7 @@ namespace Nebula.Serialization.Serializers
         /// Reads a full delta and applies it to the baseline value.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static void ReadFullDelta(NetBuffer buffer, SerialVariantType type, IntWidth intWidth, string subtype, ref PropertyCache baseline, ref PropertyCache cache)
+        private static void ReadFullDelta(NetBuffer buffer, SerialVariantType type, IntWidth intWidth, ref PropertyCache baseline, ref PropertyCache cache)
         {
             switch (type)
             {
@@ -1439,7 +1658,7 @@ namespace Nebula.Serialization.Serializers
                 default:
                     // Fallback to absolute for unsupported delta types
                     Debugger.Instance.Log(Debugger.DebugLevel.WARN, $"Full delta not supported for type {type}, reading absolute");
-                    ReadAbsoluteValue(buffer, type, subtype, ref cache);
+                    ReadAbsoluteValue(buffer, type, intWidth, ref cache);
                     break;
             }
         }
@@ -1478,8 +1697,7 @@ namespace Nebula.Serialization.Serializers
             var serializer = Protocol.GetSerializer(_propClassIndex[propIndex]);
             if (serializer == null)
             {
-                var missing = Protocol.UnpackProperty(_cachedSceneFilePath, propIndex);
-                Debugger.Instance.Log(Debugger.DebugLevel.ERROR, $"No serializer found for {missing.NodePath}.{missing.Name}");
+                Debugger.Instance.Log(Debugger.DebugLevel.ERROR, $"No serializer found for {PropertyNameForLog(propIndex)}");
                 return;
             }
 
@@ -1513,12 +1731,43 @@ namespace Nebula.Serialization.Serializers
             // computed against entries of this ring at their respective acked ticks.
             if (_propertyCount > 0 && (NetRunner.Instance.IsServer || ForceRingCaptureForTests) && network.CurrentWorld != null)
             {
+                // Quantized dead-band: a dirty property whose value still encodes to the
+                // grid cell last shipped has nothing to say on the wire. Dropped from the
+                // tick's dirty set here, before any peer is visited, so it is memo-safe and
+                // lets a jittering-but-still node reach Settled. _nonDefaultMask above has
+                // already recorded the write for initial sync. Per-peer props never get
+                // here (NEBULA010 refuses Quantize with PerPeerState).
+                long quantizedDirty = processingDirtyMask & _quantizedMask;
+                while (quantizedDirty != 0)
+                {
+                    int propIndex = System.Numerics.BitOperations.TrailingZeroCount(quantizedDirty);
+                    quantizedDirty &= quantizedDirty - 1;
+                    if (!_propIsPerPeer[propIndex] && GridUnchanged(propIndex))
+                    {
+                        processingDirtyMask &= ~(1L << propIndex);
+                    }
+                }
+
                 _tickValueRing ??= new TickSnapshot[SNAPSHOT_RING_SIZE];
                 Tick tick = network.CurrentWorld.CurrentTick;
                 ref var entry = ref _tickValueRing[tick % SNAPSHOT_RING_SIZE];
                 entry.Values ??= new PropertyCache[_propertyCount];
                 Array.Copy(network.CachedProperties, entry.Values, _propertyCount);
                 entry.Tick = tick;
+
+                // Baseline canonicalisation: a quantized grid property's ring slot holds the
+                // value the CLIENT holds after decoding it, so both sides compute the
+                // delta's Quantize(baseline) from bit-identical floats. Gameplay keeps
+                // reading full precision from CachedProperties; only the delta ring is
+                // canonical. Quaternions are skipped: they never delta (SupportsDelta).
+                long canonical = _quantizedMask;
+                while (canonical != 0)
+                {
+                    int propIndex = System.Numerics.BitOperations.TrailingZeroCount(canonical);
+                    canonical &= canonical - 1;
+                    if (_propQuantComponents[propIndex] == 0) continue;
+                    QuantizedCodec.Canonicalize(ref entry.Values[propIndex], _propTypes[propIndex], _propUnitVector[propIndex], _propQuantStep[propIndex]);
+                }
             }
         }
 
@@ -2369,9 +2618,8 @@ namespace Nebula.Serialization.Serializers
                         }
                         catch (Exception ex)
                         {
-                            var prop = Protocol.UnpackProperty(_cachedSceneFilePath, propIndex);
                             Debugger.Instance.Log(Debugger.DebugLevel.ERROR,
-                                $"Error serializing property {prop.NodePath}.{prop.Name}: {ex.InnerException?.Message ?? ex.Message}");
+                                $"Error serializing property {PropertyNameForLog(propIndex)}: {ex.InnerException?.Message ?? ex.Message}");
                             // Clear the bit AND rewind - stray partial bytes would desync the
                             // whole stream for every property and node after this one
                             actualMask[i] &= (byte)~(1 << j);
@@ -2525,9 +2773,8 @@ namespace Nebula.Serialization.Serializers
                 }
                 catch (Exception ex)
                 {
-                    var prop = Protocol.UnpackProperty(_cachedSceneFilePath, propIndex);
                     Debugger.Instance.Log(Debugger.DebugLevel.ERROR,
-                        $"Error serializing object property {prop.NodePath}.{prop.Name}: {ex.InnerException?.Message ?? ex.Message}");
+                        $"Error serializing object property {PropertyNameForLog(propIndex)}: {ex.InnerException?.Message ?? ex.Message}");
                     // Rewind on error
                     buffer.WritePosition = startPos;
                     BankNodeRefIfMasked(propIndex);
@@ -2757,6 +3004,23 @@ namespace Nebula.Serialization.Serializers
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void WriteAbsolute(WorldRunner currentWorld, NetPeer peer, NetBuffer buffer, int propIndex, ref PropertyCache current)
         {
+            if (_propQuantStep[propIndex] > 0f)
+            {
+                if (_propTypes[propIndex] == SerialVariantType.Quaternion)
+                {
+                    NetWriter.WriteByte(buffer, (byte)(DeltaEncodingFlags.Absolute | DeltaEncodingFlags.QuatCompressed));
+                    NetWriter.WriteUInt32(buffer, QuantizedCodec.PackQuat(current.QuatValue, _propQuantBits[propIndex]));
+                }
+                else
+                {
+                    Span<int> codes = stackalloc int[QuantizedCodec.MaxComponents];
+                    GridCodes(propIndex, in current, codes);
+                    NetWriter.WriteByte(buffer, (byte)DeltaEncodingFlags.Absolute);
+                    QuantizedCodec.WriteCodes(buffer, codes, _propQuantComponents[propIndex]);
+                }
+                return;
+            }
+
             // Quaternion: use smallest-three compression
             if (_propTypes[propIndex] == SerialVariantType.Quaternion)
             {
@@ -2803,6 +3067,30 @@ namespace Nebula.Serialization.Serializers
             ref PropertyCache baseline)
         {
             var type = _propTypes[propIndex];
+
+            if (_propQuantStep[propIndex] > 0f)
+            {
+                // Integer step-count delta against the canonical ring value: exact by
+                // construction (the client adds it to Quantize(its identical baseline)),
+                // so never lossy. Small packed word when every component fits, else the
+                // varint form - TryWriteSmallDelta writes nothing when it declines.
+                int count = _propQuantComponents[propIndex];
+                Span<int> codes = stackalloc int[QuantizedCodec.MaxComponents];
+                Span<int> baseCodes = stackalloc int[QuantizedCodec.MaxComponents];
+                GridCodes(propIndex, in current, codes);
+                GridCodes(propIndex, in baseline, baseCodes);
+                for (int k = 0; k < count; k++) codes[k] -= baseCodes[k];
+
+                int flagPos = buffer.WritePosition;
+                NetWriter.WriteByte(buffer, (byte)DeltaEncodingFlags.DeltaSmall);
+                if (!QuantizedCodec.TryWriteSmallDelta(buffer, codes, count))
+                {
+                    buffer.WritePosition = flagPos;
+                    NetWriter.WriteByte(buffer, (byte)DeltaEncodingFlags.DeltaFull);
+                    QuantizedCodec.WriteCodes(buffer, codes, count);
+                }
+                return false;
+            }
 
             switch (type)
             {

@@ -533,7 +533,9 @@ namespace Nebula.Generators
                                 Predicted = prop.Value.Predicted,
                                 ChunkBudget = prop.Value.ChunkBudget,
                                 IsObjectProperty = prop.Value.IsObjectProperty,
-                                IsPerPeer = prop.Value.IsPerPeer
+                                IsPerPeer = prop.Value.IsPerPeer,
+                                Quantize = prop.Value.Quantize,
+                                UnitVector = prop.Value.UnitVector
                             };
                         }
                     }
@@ -627,7 +629,9 @@ namespace Nebula.Generators
                             Predicted = prop.Predicted,
                             ChunkBudget = prop.ChunkBudget,
                             IsObjectProperty = isObjectProperty,
-                            IsPerPeer = prop.IsPerPeer
+                            IsPerPeer = prop.IsPerPeer,
+                            Quantize = prop.Quantize,
+                            UnitVector = prop.UnitVector
                         };
                     }
                 }

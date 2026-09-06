@@ -36,6 +36,9 @@ public class PropsMemoTests
         /// lookup. Worlds and serializers stay per-fixture; only the identity is shared.
         /// </summary>
         public Fixture(bool memoOn, UUID sharedPeerId, params SerialVariantType[] propTypes)
+            : this(memoOn, sharedPeerId, propTypes, null) { }
+
+        public Fixture(bool memoOn, UUID sharedPeerId, SerialVariantType[] propTypes, float[] quantizeSteps)
         {
             World = new WorldRunner();
             Peer = default;
@@ -50,7 +53,7 @@ public class PropsMemoTests
             {
                 Node.Network.CachedProperties[i] = new PropertyCache { Type = propTypes[i], IntValue = 40 + i };
             }
-            Serializer = new NetPropertiesSerializer(Node.Network, propTypes)
+            Serializer = new NetPropertiesSerializer(Node.Network, propTypes, null, quantizeSteps)
             {
                 MemoOverrideForTests = memoOn,
                 ForceRingCaptureForTests = true,
@@ -268,11 +271,29 @@ public class PropsMemoTests
         RunOnOffEquivalence(types);
     }
 
-    private static void RunOnOffEquivalence(params SerialVariantType[] types)
+    // 7c. The wide matrix again with every float QUANTIZED (0.01 step): the integer delta
+    //     forms, the canonical ring and the dead-band filter are all node-level, so the
+    //     memo signature must still describe the bytes completely.
+    [NebulaUnitTest]
+    public void OnOffEquivalence_RandomizedSchedules_QuantizedMembers()
+    {
+        var types = new SerialVariantType[24];
+        var steps = new float[24];
+        for (int i = 0; i < types.Length; i++)
+        {
+            types[i] = (i % 3 == 1) ? SerialVariantType.Float : SerialVariantType.Int;
+            steps[i] = (i % 3 == 1) ? 0.01f : 0f;
+        }
+        RunOnOffEquivalence(types, steps);
+    }
+
+    private static void RunOnOffEquivalence(params SerialVariantType[] types) => RunOnOffEquivalence(types, null);
+
+    private static void RunOnOffEquivalence(SerialVariantType[] types, float[] quantizeSteps)
     {
         var peerId = UUID.NewUUID();
-        using var on = new Fixture(memoOn: true, peerId, types);
-        using var off = new Fixture(memoOn: false, peerId, types);
+        using var on = new Fixture(memoOn: true, peerId, types, quantizeSteps);
+        using var off = new Fixture(memoOn: false, peerId, types, quantizeSteps);
 
         long allProps = types.Length >= 64 ? -1L : (1L << types.Length) - 1;
         var rng = new Random(1234);   // fixed seed: failures must reproduce
@@ -307,14 +328,20 @@ public class PropsMemoTests
                 f.Serializer.Begin();
             }
 
+            // The second export of a peer in one tick is NOT a repeat of the first: a
+            // settle absolute in the first export clears the peer's lossy bit, so the
+            // second one legitimately omits that property. So the memo-served second
+            // export is compared against a slow-path second export from identical
+            // state, not against the first.
             var bufOnA = Buffer(); on.Serializer.Export(on.World, on.Peer, bufOnA, int.MaxValue);
             var bufOnB = Buffer(); on.Serializer.Export(on.World, on.Peer, bufOnB, int.MaxValue);
-            var bufOff = Buffer(); off.Serializer.Export(off.World, off.Peer, bufOff, int.MaxValue);
+            var bufOffA = Buffer(); off.Serializer.Export(off.World, off.Peer, bufOffA, int.MaxValue);
+            var bufOffB = Buffer(); off.Serializer.Export(off.World, off.Peer, bufOffB, int.MaxValue);
 
-            Assert.True(bufOnA.WrittenSpan.SequenceEqual(bufOff.WrittenSpan),
+            Assert.True(bufOnA.WrittenSpan.SequenceEqual(bufOffA.WrittenSpan),
                 $"tick {tick}: memo-on first export diverged from memo-off");
-            Assert.True(bufOnA.WrittenSpan.SequenceEqual(bufOnB.WrittenSpan),
-                $"tick {tick}: memo-served bytes diverged from fresh encode");
+            Assert.True(bufOnB.WrittenSpan.SequenceEqual(bufOffB.WrittenSpan),
+                $"tick {tick}: memo-served bytes diverged from fresh encode of the same state");
 
             foreach (var f in new[] { on, off })
             {

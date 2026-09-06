@@ -42,6 +42,10 @@ namespace Nebula.Generators
             /// When true, this property stores per-peer values (different value for each connected peer).
             /// </summary>
             public bool IsPerPeer { get; init; } = false;
+            /// <summary>Wire grid step; 0 = not quantized. See NetProperty.Quantize.</summary>
+            public float Quantize { get; init; } = 0f;
+            /// <summary>Vector3 sent as an octahedral unit direction. See NetProperty.UnitVector.</summary>
+            public bool UnitVector { get; init; } = false;
         }
 
         public sealed class NetFunctionInfo
@@ -362,6 +366,8 @@ namespace Nebula.Generators
                         Predicted = GetNamedArgument(netPropAttr, "Predicted", false),
                         ChunkBudget = GetNamedArgument(netPropAttr, "ChunkBudget", 256),
                         IsPerPeer = GetNamedArgument(netPropAttr, "PerPeerState", false),
+                        Quantize = GetNamedArgument(netPropAttr, "Quantize", 0f),
+                        UnitVector = GetNamedArgument(netPropAttr, "UnitVector", false),
                     };
                 }
 

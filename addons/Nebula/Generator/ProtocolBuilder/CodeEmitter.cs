@@ -154,6 +154,10 @@ namespace Nebula.Generators
                         Mix(prop.IsPerPeer ? "1" : "0");
                         Mix(prop.IsEnum ? "1" : "0");
                         Mix(prop.ChunkBudget.ToString(CultureInfo.InvariantCulture));
+                        // Quantization is wire layout (integer step counts instead of floats),
+                        // unlike the client-local NotifyOnChange/Interpolate/Predicted flags.
+                        Mix(prop.Quantize.ToString("R", CultureInfo.InvariantCulture));
+                        Mix(prop.UnitVector ? "1" : "0");
                     }
                 }
 
@@ -450,7 +454,9 @@ namespace Nebula.Generators
             sb.AppendLine($"{indent}    {prop.Predicted.ToString().ToLowerInvariant()},");
             sb.AppendLine($"{indent}    {prop.ChunkBudget},");
             sb.AppendLine($"{indent}    {prop.IsObjectProperty.ToString().ToLowerInvariant()},");
-            sb.AppendLine($"{indent}    {prop.IsPerPeer.ToString().ToLowerInvariant()}),");
+            sb.AppendLine($"{indent}    {prop.IsPerPeer.ToString().ToLowerInvariant()},");
+            sb.AppendLine($"{indent}    {prop.Quantize.ToString("R", CultureInfo.InvariantCulture)}f,");
+            sb.AppendLine($"{indent}    {prop.UnitVector.ToString().ToLowerInvariant()}),");
         }
 
         private static void EmitPropertyWithIntKey(StringBuilder sb, int key, PropertyData prop, string indent)
@@ -484,7 +490,9 @@ namespace Nebula.Generators
             sb.AppendLine($"{indent}    {prop.Predicted.ToString().ToLowerInvariant()},");
             sb.AppendLine($"{indent}    {prop.ChunkBudget},");
             sb.AppendLine($"{indent}    {prop.IsObjectProperty.ToString().ToLowerInvariant()},");
-            sb.AppendLine($"{indent}    {prop.IsPerPeer.ToString().ToLowerInvariant()}),");
+            sb.AppendLine($"{indent}    {prop.IsPerPeer.ToString().ToLowerInvariant()},");
+            sb.AppendLine($"{indent}    {prop.Quantize.ToString("R", CultureInfo.InvariantCulture)}f,");
+            sb.AppendLine($"{indent}    {prop.UnitVector.ToString().ToLowerInvariant()}),");
         }
 
         private static void EmitFunctionsMap(StringBuilder sb, ProtocolData data)
