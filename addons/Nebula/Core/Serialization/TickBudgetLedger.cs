@@ -35,6 +35,10 @@ namespace Nebula.Serialization
         private static int FramingCost(bool firstSectionForNode, bool opensNewGroup)
             => (firstSectionForNode ? 1 : 0) + (opensNewGroup ? 8 : 0);
 
+        /// <summary>Framing a section paid, for byte attribution in diagnostics counters.</summary>
+        public static int FramingCostForDiagnostics(bool firstSectionForNode, bool opensNewGroup)
+            => FramingCost(firstSectionForNode, opensNewGroup);
+
         /// <summary>
         /// Max section payload bytes that can still be committed for a node with the given
         /// framing situation. Never negative.

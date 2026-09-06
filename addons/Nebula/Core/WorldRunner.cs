@@ -3629,16 +3629,24 @@ namespace Nebula
                     }
 
                     bool first = !NodeIdUtils.IsBitSet(_updatedNodesMask, localNodeId);
+                    bool opensGroup = first && GroupIsClosed(localNodeId);
                     _tempSerializerBuffer.Reset();
                     var result = serializer.Export(this, peer, _tempSerializerBuffer,
-                        ledger.SectionBudget(first, first && GroupIsClosed(localNodeId)));
+                        ledger.SectionBudget(first, opensGroup));
                     if (result == ExportResult.None || _tempSerializerBuffer.WritePosition == 0)
                     {
                         continue;
                     }
+                    int resyncSectionBytes = _tempSerializerBuffer.WritePosition;
                     if (!TryAppendSection(netController, localNodeId, InterestResyncSerializerIndex, ref ledger))
                     {
-                        continue; // dropped: the next stagger slot resyncs, no ack state
+                        continue; // dropped: resent next tick, no packet-coupled state stamped
+                    }
+                    if (_profiler != null)
+                    {
+                        _profiler.Add(Diagnostics.TickProfiler.Counter.ResyncSections, 1);
+                        _profiler.Add(Diagnostics.TickProfiler.Counter.ResyncBytes,
+                            resyncSectionBytes + TickBudgetLedger.FramingCostForDiagnostics(first, opensGroup));
                     }
                     serializer.CommitExport(this, peer, CurrentTick);
                 }
