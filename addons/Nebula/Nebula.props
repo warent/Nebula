@@ -4,7 +4,22 @@
     <PackageReference Include="MongoDB.Bson" Version="2.28.0" />
     <PackageReference Include="FixedMathSharp" Version="1.2.2" />
     <PackageReference Include="xunit" Version="2.9.0" />
-    <PackageReference Include="ENet-CSharp" Version="2.4.8" />
+
+    <!--
+      ENet. Upstream stopped publishing to NuGet at 2.4.8, so both the managed
+      bindings (ENet/ENet.cs, compiled by the default source glob) and the
+      native libraries below are vendored from the ENet-CSharp submodule
+      instead. These land beside the built assembly, where ENet/ENetNativeResolver.cs
+      picks them up; the package's deps.json entries used to do that job. macOS is
+      a universal binary, which replaces the old arm64 copy-over-the-x86_64 hack.
+      Run native/build-natives.sh to regenerate all four from the submodule.
+    -->
+    <Content Include="$(MSBuildThisFileDirectory)native\osx\libenet.dylib" Link="enet.dylib"
+      CopyToOutputDirectory="PreserveNewest" Visible="false" />
+    <Content Include="$(MSBuildThisFileDirectory)native\linux-x64\libenet.so" Link="libenet.so"
+      CopyToOutputDirectory="PreserveNewest" Visible="false" />
+    <Content Include="$(MSBuildThisFileDirectory)native\win-x64\enet.dll" Link="enet.dll"
+      CopyToOutputDirectory="PreserveNewest" Visible="false" />
 
     <!-- Fody Weavers -->
     <PackageReference Include="Fody" Version="6.8.0" />
@@ -33,14 +48,4 @@
     <ServerGarbageCollection>true</ServerGarbageCollection>
     <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
   </PropertyGroup>
-
-  <!-- Override ENet native library with arm64 version on Apple Silicon -->
-  <Target Name="CopyArm64ENet" AfterTargets="Build" Condition="$([MSBuild]::IsOSPlatform('OSX'))">
-    <PropertyGroup>
-      <ENetSourcePath>$(MSBuildThisFileDirectory)native/osx-arm64/libenet.dylib</ENetSourcePath>
-      <ENetTargetPath>$(OutputPath)runtimes/osx/native/libenet.dylib</ENetTargetPath>
-    </PropertyGroup>
-    <Copy SourceFiles="$(ENetSourcePath)" DestinationFiles="$(ENetTargetPath)" Condition="Exists('$(ENetSourcePath)')" />
-    <Message Importance="high" Text="Copied arm64 libenet.dylib to $(ENetTargetPath)" Condition="Exists('$(ENetSourcePath)')" />
-  </Target>
 </Project>
