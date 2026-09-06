@@ -3269,8 +3269,9 @@ namespace Nebula
         /// <summary>
         /// Props phase stops serving (and defers the rest of the rotation) once the
         /// remaining section budget drops below this. Ceiling of the smallest useful
-        /// props section: presence mask (max 64 props = 8 bytes) + age byte + smallest
-        /// property write (2 bytes), rounded up for slack.
+        /// props section: presence mask reservation (max 64 props = 8 bytes, plus the
+        /// two-level header = 9; see PresenceMask) + age byte + smallest property write
+        /// (2 bytes), rounded up for slack.
         /// </summary>
         private const int PropsSectionFloor = 16;
 
