@@ -265,6 +265,13 @@ namespace Nebula.Serialization.Serializers
                             nestedSpawnSerializer.spawnWindows.TryGetValue(peerId, out var nestedWindow);
                             nestedWindow.RecordSend(tick);
                             nestedSpawnSerializer.spawnWindows[peerId] = nestedWindow;
+
+                            // The child committed no section of its own, so the host would
+                            // never route this tick's ack to it - and the window just
+                            // stamped would be unreachable. Register it as a rider of this
+                            // packet. (Before the per-tick ack ring, a child with nothing
+                            // else to send could sit in Spawning until it happened to export.)
+                            currentWorld.NoteNestedSpawnRider(nested);
                         }
                     }
                     break;
@@ -704,7 +711,7 @@ namespace Nebula.Serialization.Serializers
             }
         }
 
-        public bool Acknowledge(WorldRunner currentWorld, NetPeer peer, Tick tick)
+        public void Acknowledge(WorldRunner currentWorld, NetPeer peer, Tick tick)
         {
             var peerId = NetRunner.Instance.GetPeerId(peer);
 
@@ -745,7 +752,7 @@ namespace Nebula.Serialization.Serializers
                 }
                 // If the despawn is still unacked, don't process spawn ACK
                 // The node is being despawned, so transitioning to Spawned would be wrong
-                return despawnWindows.ContainsKey(peerId) || spawnWindows.ContainsKey(peerId);
+                return;
             }
 
             // Handle spawn acknowledgment (only if no despawn is pending).
@@ -765,9 +772,6 @@ namespace Nebula.Serialization.Serializers
                     spawnWindows.Remove(peerId); // Clean up after successful ack
                 }
             }
-
-            // Still pending while an unacked spawn or despawn send exists for this peer
-            return spawnWindows.ContainsKey(peerId) || despawnWindows.ContainsKey(peerId);
         }
 
         // Import is client-only and infrequent, less critical to optimize

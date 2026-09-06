@@ -93,13 +93,16 @@ namespace Nebula.Serialization.Serializers
         /// Server-side only. Called when a peer acknowledges the packet exported at
         /// <paramref name="tick"/>. Implementations must only commit state that was sent
         /// at or before that tick.
+        ///
+        /// Delivery contract: the host only calls this for ticks in which this node had a
+        /// section committed into the peer's packet (or, for a nested scene, rode an
+        /// ancestor's spawn table) - see <c>WorldRunner.PeerAcknowledge</c> and
+        /// <c>SentNodeRing</c>. An implementation must therefore stamp every "sent at T"
+        /// record from <see cref="CommitExport"/> (or from inside a write the host will
+        /// commit), never from a path that produces no bytes: a stamp with no section is a
+        /// stamp no ack can ever reach.
         /// </summary>
-        /// <returns>
-        /// True if this serializer still has unacknowledged data for the peer; false when
-        /// fully acked. When every serializer of a node returns false, the node is removed
-        /// from the per-peer pending-ack set (it re-enters on its next export).
-        /// </returns>
-        public bool Acknowledge(WorldRunner currentWorld, NetPeer peer, Tick tick);
+        public void Acknowledge(WorldRunner currentWorld, NetPeer peer, Tick tick);
 
         public void Cleanup();
         

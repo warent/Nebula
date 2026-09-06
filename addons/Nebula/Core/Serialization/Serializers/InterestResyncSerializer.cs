@@ -25,7 +25,7 @@ namespace Nebula.Serialization.Serializers
         public void Begin() { }
         public void Cleanup() { }
         public void CleanupPeer(UUID peerId) { }
-        public bool Acknowledge(WorldRunner currentWorld, NetPeer peer, Tick latestAck) => false;
+        public void Acknowledge(WorldRunner currentWorld, NetPeer peer, Tick latestAck) { }
 
         public ExportResult Export(WorldRunner currentWorld, NetPeer peer, NetBuffer buffer, int maxBytes)
         {

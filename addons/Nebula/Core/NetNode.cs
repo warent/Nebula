@@ -56,6 +56,17 @@ namespace Nebula
             Serializers = [spawnSerializer, propertySerializer, interestResyncSerializer];
         }
 
+        /// <summary>
+        /// Test seam: installs hand-built serializers. SetupSerializers needs the Protocol
+        /// registry (a registered net scene), which the Protocol-free unit fixtures don't have;
+        /// this lets a WorldRunner-level test drive PeerAcknowledge against a recording
+        /// serializer and a Protocol-free NetPropertiesSerializer.
+        /// </summary>
+        internal void SetSerializersForTests(IStateSerializer[] serializers)
+        {
+            Serializers = serializers;
+        }
+
         public virtual void _WorldReady() { }
         public virtual void _NetworkProcess(int _tick) { }
         public virtual void _Despawn() { }

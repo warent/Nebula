@@ -3052,9 +3052,36 @@ namespace Nebula.Serialization.Serializers
             }
         }
 
-        public bool Acknowledge(WorldRunner currentWorld, NetPeer peer, Tick latestAck)
+        public void Acknowledge(WorldRunner currentWorld, NetPeer peer, Tick latestAck)
         {
             var peerId = NetRunner.Instance.GetPeerId(peer);
+
+            // Zero-alloc ref access. ExportCore creates this state before it writes a single
+            // byte and CommitExport refuses to stamp without it, so "no state" means no
+            // section of this node has ever been committed to this peer: nothing to ack.
+            ref var state = ref CollectionsMarshal.GetValueRefOrNullRef(_peerStates, peerId);
+            if (Unsafe.IsNullRef(ref state) || !state.IsInitialized)
+            {
+                return;
+            }
+
+            // An ack for tick N proves the peer received the packet exported at N, which
+            // contained the tick-N value of every then-pending property. It proves nothing
+            // about sends at later ticks, so only the tick-N record is committed.
+            //
+            // The record gates the OBJECT properties too: their bytes only ever ship inside a
+            // committed props section, and CommitExport stamps this record for every committed
+            // section, object-only ones included (primitiveSentMask == 0). No record means no
+            // section rode tick N, so there is nothing for an array to commit - and skipping
+            // the loop is what makes an ack cost nothing for a node that only shipped a spawn
+            // or resync byte that tick. Consequence for an ack older than the 32-tick history
+            // (slot overwritten): the object loop no longer runs where it used to. Object
+            // properties resend every tick until acked, so the next in-range ack clears them.
+            ref var ackedRecord = ref state.SentHistory[latestAck % SNAPSHOT_RING_SIZE];
+            if (ackedRecord.Tick != latestAck)
+            {
+                return;
+            }
 
             // Call OnPeerAcknowledge on all object properties (they gate on the tick themselves)
             for (int i = 0; i < _propertyCount; i++)
@@ -3077,70 +3104,46 @@ namespace Nebula.Serialization.Serializers
                 }
             }
 
-            // Zero-alloc ref access
-            ref var state = ref CollectionsMarshal.GetValueRefOrNullRef(_peerStates, peerId);
-            if (Unsafe.IsNullRef(ref state) || !state.IsInitialized)
-            {
-                // No primitive state yet; object props were still notified above
-                return _hasObjectProps;
-            }
+            long ackedSent = ackedRecord.SentMask;
 
-            // An ack for tick N proves the peer received the packet exported at N, which
-            // contained the tick-N value of every then-pending property. It proves nothing
-            // about sends at later ticks, so only the tick-N record is committed.
-            ref var ackedRecord = ref state.SentHistory[latestAck % SNAPSHOT_RING_SIZE];
-            if (ackedRecord.Tick == latestAck)
+            if (ackedSent != 0)
             {
-                long ackedSent = ackedRecord.SentMask;
-
-                if (ackedSent != 0)
+                // Mark these props as confirmed-received (enables delta encoding)
+                for (int i = 0; i < state.AckedMask.Length; i++)
                 {
-                    // Mark these props as confirmed-received (enables delta encoding)
-                    for (int i = 0; i < state.AckedMask.Length; i++)
-                    {
-                        int shift = i * 8;
-                        if (shift >= 64) break;
-                        state.AckedMask[i] |= (byte)((ackedSent >> shift) & 0xFF);
-                    }
+                    int shift = i * 8;
+                    if (shift >= 64) break;
+                    state.AckedMask[i] |= (byte)((ackedSent >> shift) & 0xFF);
+                }
 
-                    // Stop resending only props whose value did NOT change again after the
-                    // acked tick - a later DIRTY send carries a newer value the client may not
-                    // have yet. A later RESEND of the same value does not (see DirtySentMask).
-                    long laterSent = 0;
-                    for (int i = 0; i < state.SentHistory.Length; i++)
+                // Stop resending only props whose value did NOT change again after the
+                // acked tick - a later DIRTY send carries a newer value the client may not
+                // have yet. A later RESEND of the same value does not (see DirtySentMask).
+                long laterSent = 0;
+                for (int i = 0; i < state.SentHistory.Length; i++)
+                {
+                    if (state.SentHistory[i].Tick > latestAck)
                     {
-                        if (state.SentHistory[i].Tick > latestAck)
-                        {
-                            laterSent |= state.SentHistory[i].DirtySentMask;
-                        }
-                    }
-
-                    long clearMask = ackedSent & ~laterSent;
-                    for (int i = 0; i < state.PendingDirtyMask.Length; i++)
-                    {
-                        int shift = i * 8;
-                        if (shift >= 64) break;
-                        state.PendingDirtyMask[i] &= (byte)~((clearMask >> shift) & 0xFF);
+                        laterSent |= state.SentHistory[i].DirtySentMask;
                     }
                 }
 
-                // The baseline must be a tick at which THIS node's data was received, so
-                // the client is guaranteed to have a matching applied-state ring entry.
-                // Only advance on ticks with a SentHistory record (node exported that tick).
-                if (latestAck > state.LatestAckedTick)
+                long clearMask = ackedSent & ~laterSent;
+                for (int i = 0; i < state.PendingDirtyMask.Length; i++)
                 {
-                    state.LatestAckedTick = latestAck;
+                    int shift = i * 8;
+                    if (shift >= 64) break;
+                    state.PendingDirtyMask[i] &= (byte)~((clearMask >> shift) & 0xFF);
                 }
             }
 
-            // Still pending if any primitive props await an ack (object props conservatively
-            // keep the node in the pending set; re-adding on next export is cheap)
-            if (_hasObjectProps) return true;
-            for (int i = 0; i < state.PendingDirtyMask.Length; i++)
+            // The baseline must be a tick at which THIS node's data was received, so
+            // the client is guaranteed to have a matching applied-state ring entry.
+            // Only advance on ticks with a SentHistory record (node exported that tick).
+            if (latestAck > state.LatestAckedTick)
             {
-                if (state.PendingDirtyMask[i] != 0) return true;
+                state.LatestAckedTick = latestAck;
             }
-            return false;
         }
 
     }
