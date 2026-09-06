@@ -182,6 +182,12 @@ namespace Nebula.Diagnostics
             PropsMemoSlow,
             /// <summary>Eligible sections that found the memo full. Nonzero = raise MemoCapacity.</summary>
             PropsMemoOverflow,
+            /// <summary>
+            /// Nodes whose serializers were visited by an acknowledgement (PeerAcknowledge drain).
+            /// Per tick this should track "nodes that shipped a section" x peers, not "nodes ever
+            /// sent" x peers - the latter is what the pre-ring pending set cost.
+            /// </summary>
+            AckNodesVisited,
             Count,
         }
 
@@ -190,6 +196,7 @@ namespace Nebula.Diagnostics
             "pk_candidates", "pk_bytes_measured", "pk_deltas_chosen",
             "pk_chosen_age_sum", "pk_measured",
             "memo_hit", "memo_miss", "memo_slow", "memo_overflow",
+            "ack_nodes_visited",
         };
         private const int CounterCount = (int)Counter.Count;
 

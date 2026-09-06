@@ -150,9 +150,8 @@ public class PropsBudgetTests
         f.Serializer.CommitExport(f.World, f.Peer, 5);
         Assert.Equal(0b11, f.Serializer.PendingDirtyByteForTests(f.PeerId, 0));
 
-        bool stillPending = f.Serializer.Acknowledge(f.World, f.Peer, 5);
+        f.Serializer.Acknowledge(f.World, f.Peer, 5);
 
-        Assert.False(stillPending);
         Assert.Equal(0, f.Serializer.PendingDirtyByteForTests(f.PeerId, 0));
     }
 
@@ -176,13 +175,12 @@ public class PropsBudgetTests
         buf.Reset();
         Assert.Equal(ExportResult.None, f.Serializer.Export(f.World, f.Peer, buf, 0));
 
-        bool stillPending = f.Serializer.Acknowledge(f.World, f.Peer, 6);
+        f.Serializer.Acknowledge(f.World, f.Peer, 6);
 
-        Assert.True(stillPending);
         Assert.Equal(0b11, f.Serializer.PendingDirtyByteForTests(f.PeerId, 0));
 
         // The genuine send-tick ack still lands
-        Assert.False(f.Serializer.Acknowledge(f.World, f.Peer, 5));
+        f.Serializer.Acknowledge(f.World, f.Peer, 5);
         Assert.Equal(0, f.Serializer.PendingDirtyByteForTests(f.PeerId, 0));
     }
 }

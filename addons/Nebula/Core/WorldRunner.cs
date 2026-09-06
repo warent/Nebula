@@ -1640,7 +1640,7 @@ namespace Nebula
             _peerLastAckTick.Remove(peerId);
             ResetPackState(peerId);
             _peerPackWindows.Remove(peerId);
-            _peerPendingAcks.Remove(peerId); // Fix #5: Clean up pending acks tracking
+            _peerSentRings.Remove(peerId); // Per-tick ack routing
             _peerNetBufferPool.Remove(peerId); // Clean up pooled export buffer
             _peerPropsCursors.Remove(peerId); // Round-robin cursor for the props phase
             _peerListDirty = true; // Fix #1: Mark peer list as dirty
@@ -2903,10 +2903,30 @@ namespace Nebula
         private bool _peerListDirty = true;
 
         /// <summary>
-        /// Tracks which network objects have pending unacked data per peer (Fix #5).
-        /// This allows PeerAcknowledge to only iterate relevant objects instead of all NetScenes.
+        /// Per peer: which nodes had a section committed into each recent tick's packet, so an
+        /// ack for tick T visits exactly those nodes (see <see cref="SentNodeRing"/>). Created
+        /// lazily inside ExportState on the world thread - never from JoinPeer, which runs on
+        /// main while this world may be mid-export - and dropped with the rest of the per-peer
+        /// state in TeardownPeer/ExitPeer.
         /// </summary>
-        private Dictionary<UUID, HashSet<NetworkController>> _peerPendingAcks = new();
+        private readonly Dictionary<UUID, SentNodeRing> _peerSentRings = new();
+
+        /// <summary>
+        /// Controller behind each peer-local node id that has a section in the packet being
+        /// assembled. Written by TryAppendSection on a node's first section; only ever read
+        /// behind a set bit of <c>_updatedNodesMask</c>, so entries left over from an earlier
+        /// peer are never observed.
+        /// </summary>
+        private readonly NetworkController[] _peerNodesControllers = new NetworkController[NodeIdUtils.MAX_NETWORK_NODES];
+
+        /// <summary>
+        /// Nested scenes that rode an ancestor's spawn table in the packet being assembled
+        /// without committing a section of their own (SpawnSerializer.CommitExport reports
+        /// them via <see cref="NoteNestedSpawnRider"/>). Registered into the ack ring after
+        /// the mask walk, minus any that also committed a section. Cleared per peer.
+        /// </summary>
+        private readonly List<NetworkController> _tickNestedRiders = new(16);
+        private readonly long[] _tickRiderMask = NodeIdUtils.CreateMasks();
 
         /// <summary>
         /// Buffer for tick-aligned player joined events.
@@ -3169,9 +3189,9 @@ namespace Nebula
             // Fix #1: Mark peer list as dirty so it gets rebuilt
             _peerListDirty = true;
 
-            // Fix #5: Initialize pending acks tracking for this peer
-            _peerPendingAcks[peerId] = new HashSet<NetworkController>();
-            
+            // Deliberately no per-peer export state here (ack ring, buffer pool, cursors): this
+            // runs on main, ExportState owns those on the world thread and creates them lazily.
+
             // Initialize interest layers for the root scene immediately so properties
             // can be exported on the same tick as the spawn
             if (RootScene != null)
@@ -3185,6 +3205,12 @@ namespace Nebula
             var peerId = NetRunner.Instance.GetPeerId(peer);
             NetRunner.Instance.PeerWorldMap.Remove(peerId);
             PeerStates.Remove(peerId);
+            // Per-peer export state, same set TeardownPeer drops. These used to leak here.
+            _peerSentRings.Remove(peerId);
+            _peerNetBufferPool.Remove(peerId);
+            _peerPropsCursors.Remove(peerId);
+            _peerPackWindows.Remove(peerId);
+            _peerListDirty = true;
         }
 
         /// <summary>
@@ -3325,12 +3351,17 @@ namespace Nebula
                 // properties are load-bearing rather than tidy.
                 ExportPartition.Partition(_tickNodeList, peer, _tickOwnedList, _tickSharedList);
 
-                // Fix #5: Get or create pending acks set for this peer
-                if (!_peerPendingAcks.TryGetValue(peerId, out var pendingAcks))
+                // Ack routing for this packet: every node that commits a section below is
+                // registered into this tick's slot after the phases run (mask walk at the
+                // end of the loop), so the ack for CurrentTick visits exactly those nodes.
+                if (!_peerSentRings.TryGetValue(peerId, out var sentRing))
                 {
-                    pendingAcks = new HashSet<NetworkController>();
-                    _peerPendingAcks[peerId] = pendingAcks;
+                    sentRing = new SentNodeRing();
+                    _peerSentRings[peerId] = sentRing;
                 }
+                sentRing.Begin(CurrentTick);
+                _tickNestedRiders.Clear();
+                Array.Clear(_tickRiderMask, 0, NodeIdUtils.NODE_GROUPS);
 
                 var ledger = new TickBudgetLedger(payloadBudget);
                 var peerState = PeerStates[peerId];
@@ -3395,7 +3426,7 @@ namespace Nebula
                             continue;
                         }
 
-                        if (!TryAppendSection(localNodeId, SpawnSerializerIndex, ref ledger))
+                        if (!TryAppendSection(netController, localNodeId, SpawnSerializerIndex, ref ledger))
                         {
                             // Over budget: retries next tick. Should only ever be transient
                             // (a crowded packet) - a record too big for an EMPTY packet can
@@ -3411,7 +3442,6 @@ namespace Nebula
                             if (spawnPass == 0) ownedSpawnSectionsDeferred++; else spawnSectionsDeferred++;
                             continue;
                         }
-                        pendingAcks.Add(netController);
                         serializer.CommitExport(this, peer, CurrentTick);
                     }
                 }
@@ -3481,13 +3511,12 @@ namespace Nebula
                         continue;
                     }
 
-                    if (!TryAppendSection(ownedLocalId, PropsSerializerIndex, ref ledger))
+                    if (!TryAppendSection(netController, ownedLocalId, PropsSerializerIndex, ref ledger))
                     {
                         Log(Debugger.DebugLevel.ERROR,
                             $"[ExportState] BUG: owned props section for {netController.RawNode?.Name} (NetId={netController.NetId}) exceeded its budget and was dropped.");
                         continue;
                     }
-                    pendingAcks.Add(netController);
                     serializer.CommitExport(this, peer, CurrentTick);
                 }
 
@@ -3551,7 +3580,7 @@ namespace Nebula
                             continue;
                         }
 
-                        if (!TryAppendSection(localNodeId, PropsSerializerIndex, ref ledger))
+                        if (!TryAppendSection(netController, localNodeId, PropsSerializerIndex, ref ledger))
                         {
                             // Contract breach: a self-limiting serializer wrote past its
                             // section budget. The bytes are dropped and never committed,
@@ -3561,7 +3590,6 @@ namespace Nebula
                                 $"[ExportState] BUG: props section for {netController.RawNode?.Name} (NetId={netController.NetId}) exceeded its budget and was dropped.");
                             continue;
                         }
-                        pendingAcks.Add(netController);
                         serializer.CommitExport(this, peer, CurrentTick);
 
                         if (result == ExportResult.Partial && !cursorPinned)
@@ -3607,11 +3635,10 @@ namespace Nebula
                     {
                         continue;
                     }
-                    if (!TryAppendSection(localNodeId, InterestResyncSerializerIndex, ref ledger))
+                    if (!TryAppendSection(netController, localNodeId, InterestResyncSerializerIndex, ref ledger))
                     {
                         continue; // dropped: the next stagger slot resyncs, no ack state
                     }
-                    pendingAcks.Add(netController);
                     serializer.CommitExport(this, peer, CurrentTick);
                 }
 
@@ -3653,6 +3680,11 @@ namespace Nebula
                         var serializersRun = _peerNodesSerializersList[nodeId];
                         NetWriter.WriteByte(_exportPeerBuffers[peerId], serializersRun);
 
+                        // This mask is, by construction, the deduplicated set of nodes with
+                        // a committed section in this packet - so it is also the exact set
+                        // the ack for CurrentTick must visit.
+                        sentRing.Add(_peerNodesControllers[nodeId]);
+
                         // Spawn-contract breach detector: a packet may carry data WITHOUT
                         // the spawn bit only for a node whose id the client provably has
                         // or gets - spawn committed (Spawned), or riding an in-flight
@@ -3688,6 +3720,22 @@ namespace Nebula
                         }
                     }
                 }
+                // Nested scenes that rode an ancestor's spawn table this packet had their
+                // spawn windows stamped for CurrentTick without a section of their own, so
+                // the mask walk above cannot see them. Register the ones it did not: a
+                // rider that ALSO committed its own section (its props phase ran after the
+                // parent's spawn commit) is already in the ring. Must run after the mask
+                // walk so the dedup reads the final mask.
+                for (int r = 0; r < _tickNestedRiders.Count; r++)
+                {
+                    var rider = _tickNestedRiders[r];
+                    if (!peerState.WorldToPeerNodeMap.TryGetValue(rider.NetId, out var riderLocalId)) continue;
+                    if (NodeIdUtils.IsBitSet(_updatedNodesMask, riderLocalId)) continue;
+                    if (NodeIdUtils.IsBitSet(_tickRiderMask, riderLocalId)) continue;
+                    NodeIdUtils.SetBit(_tickRiderMask, riderLocalId);
+                    sentRing.Add(rider);
+                }
+
                 for (int g = 0; g < NodeIdUtils.NODE_GROUPS; g++)
                 {
                     if ((groupMask & (1 << g)) == 0) continue;
@@ -3741,7 +3789,7 @@ namespace Nebula
         /// </summary>
         private static readonly bool TraceWire = System.Environment.GetEnvironmentVariable("NEBULA_TRACE_WIRE") != null;
         private UUID _traceWirePeer;
-        private bool TryAppendSection(ushort localNodeId, int serializerIdx, ref TickBudgetLedger ledger)
+        private bool TryAppendSection(NetworkController netController, ushort localNodeId, int serializerIdx, ref TickBudgetLedger ledger)
         {
             if (TraceWire)
             {
@@ -3758,6 +3806,7 @@ namespace Nebula
             if (firstSection)
             {
                 NodeIdUtils.SetBit(_updatedNodesMask, localNodeId);
+                _peerNodesControllers[localNodeId] = netController;
                 if (!_nodeBufferPool.TryGetValue(localNodeId, out var nodeBuffer))
                 {
                     nodeBuffer = new NetBuffer();
@@ -4026,8 +4075,35 @@ namespace Nebula
             }
         }
 
-        // Reusable list for objects that had all data acked (avoids modifying HashSet during iteration)
-        private List<NetworkController> _ackedObjects = new(64);
+        /// <summary>
+        /// Called by SpawnSerializer.CommitExport, mid-peer and mid-tick on the world thread,
+        /// for a nested scene whose spawn window it just stamped because the child rode this
+        /// packet inside an ancestor's spawn table. ExportState folds these into the tick's
+        /// ack routing after its phases run (see the rider block at the end of the peer loop).
+        /// </summary>
+        internal void NoteNestedSpawnRider(NetworkController child)
+        {
+            _tickNestedRiders.Add(child);
+        }
+
+        /// <summary>
+        /// Test seam: registers <paramref name="node"/> as having shipped in the packet for
+        /// <paramref name="tick"/> to <paramref name="peerId"/>, exactly as ExportState's mask
+        /// walk would, so PeerAcknowledge can be driven without a Protocol registry.
+        /// </summary>
+        internal void RegisterSentNodeForTests(UUID peerId, Tick tick, NetworkController node)
+        {
+            if (!_peerSentRings.TryGetValue(peerId, out var ring))
+            {
+                ring = new SentNodeRing();
+                _peerSentRings[peerId] = ring;
+            }
+            if (!ring.TryGet(tick, out _))
+            {
+                ring.Begin(tick);
+            }
+            ring.Add(node);
+        }
 
         public void PeerAcknowledge(NetPeer peer, Tick tick)
         {
@@ -4072,40 +4148,32 @@ namespace Nebula
                 SetPeerState(peerId, newPeerState);
             }
 
-            // Fix #5: Only iterate objects that have pending data for this peer
-            if (!_peerPendingAcks.TryGetValue(peerId, out var pendingAcks) || pendingAcks.Count == 0)
+            // Route the ack to exactly the nodes whose bytes rode packet `tick`. Every
+            // serializer's Acknowledge only acts on ticks it committed in (spawn windows,
+            // props sent-history, object props inside a committed props section), so nothing
+            // else can have anything to do with this ack. An ack older than the ring's depth
+            // finds no slot and is dropped; every consumer resends until acked, so that
+            // costs one extra round (see SentNodeRing.Depth).
+            if (!_peerSentRings.TryGetValue(peerId, out var sentRing) || !sentRing.TryGet(tick, out var sentNodes))
             {
                 return;
             }
 
-            _ackedObjects.Clear();
-            foreach (var netController in pendingAcks)
+            for (var n = 0; n < sentNodes.Count; n++)
             {
-                if (netController == null || netController.NetNode?.Serializers == null)
+                var netController = sentNodes[n];
+                // A node can be freed between commit and ack (despawn completed, peer left).
+                if (netController == null || netController.IsMarkedForDeletion || netController.NetNode?.Serializers == null)
                 {
-                    _ackedObjects.Add(netController); // Remove invalid entries
                     continue;
                 }
 
-                bool stillPending = false;
-                for (var serializerIdx = 0; serializerIdx < netController.NetNode.Serializers.Length; serializerIdx++)
+                _profiler?.Add(Diagnostics.TickProfiler.Counter.AckNodesVisited, 1);
+                var serializers = netController.NetNode.Serializers;
+                for (var serializerIdx = 0; serializerIdx < serializers.Length; serializerIdx++)
                 {
-                    var serializer = netController.NetNode.Serializers[serializerIdx];
-                    stillPending |= serializer.Acknowledge(this, peer, tick);
+                    serializers[serializerIdx].Acknowledge(this, peer, tick);
                 }
-
-                // Fully acked - remove from the pending set so future acks skip this node.
-                // It re-enters via pendingAcks.Add() the next time it exports data.
-                if (!stillPending)
-                {
-                    _ackedObjects.Add(netController);
-                }
-            }
-
-            // Remove invalid and fully-acked entries
-            foreach (var obj in _ackedObjects)
-            {
-                pendingAcks.Remove(obj);
             }
         }
 
