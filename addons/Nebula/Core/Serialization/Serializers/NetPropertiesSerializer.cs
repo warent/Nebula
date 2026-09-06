@@ -222,6 +222,15 @@ namespace Nebula.Serialization.Serializers
         /// <summary>Pre-cached size in bytes of the property presence mask.</summary>
         private readonly int _byteCount;
 
+        /// <summary>
+        /// Bytes reserved at the head of a section for the presence mask before its contents
+        /// are known: <see cref="PresenceMask.ReservedBytes"/> of <see cref="_byteCount"/>.
+        /// Wide masks ship two-level (header + nonzero bytes), so the reservation is the
+        /// worst case and the section is compacted once the mask is final. Every budget check
+        /// measures against this width, never the compact one - see the backfill in ExportCore.
+        /// </summary>
+        private readonly int _reservedMaskBytes;
+
         /// <summary>Pre-cached: does this scene have any object (INetSerializable) properties?</summary>
         private readonly bool _hasObjectProps;
 
@@ -266,7 +275,8 @@ namespace Nebula.Serialization.Serializers
         /// <summary>
         /// The smallest possible property write: a DeltaEncodingFlags byte plus a
         /// one-byte value (e.g. bool). A section budget below
-        /// [presence mask + <see cref="AGE_HEADER_BYTES"/> + this] cannot ship anything.
+        /// [<see cref="_reservedMaskBytes"/> + <see cref="AGE_HEADER_BYTES"/> + this] cannot
+        /// ship anything.
         /// </summary>
         private const int MIN_PROPERTY_WRITE_BYTES = 2;
 
@@ -344,6 +354,7 @@ namespace Nebula.Serialization.Serializers
             // server that spawned nothing while the unit suite stayed green, because the
             // suite only exercises the Protocol-free ctor.
             _byteCount = (_propertyCount + BitConstants.BitsInByte - 1) / BitConstants.BitsInByte;
+            _reservedMaskBytes = PresenceMask.ReservedBytes(_byteCount);
 
             _propSupportsDelta = new bool[_propertyCount];
             _propIsNodeRef = new bool[_propertyCount];
@@ -880,6 +891,7 @@ namespace Nebula.Serialization.Serializers
 
             _propertyCount = propTypes.Length;
             _byteCount = (_propertyCount + BitConstants.BitsInByte - 1) / BitConstants.BitsInByte;
+            _reservedMaskBytes = PresenceMask.ReservedBytes(_byteCount);
 
             _propTypes = propTypes;
             _propSupportsDelta = new bool[_propertyCount];
@@ -983,14 +995,22 @@ namespace Nebula.Serialization.Serializers
             int startPos = buffer.ReadPosition;
             int byteCount = _byteCount;
 
-            // Decode into reusable scratch. _incomingMask is fully overwritten by the read
-            // below; _decodedMask must be cleared because it accumulates as we decode.
+            // Decode into reusable scratch. _incomingMask is fully overwritten by the decode
+            // below - a flat read writes every byte, and the two-level decode zeroes the
+            // bytes its header skips (a stale bit left from the previous payload would read
+            // as a present property and misparse everything after it). _decodedMask must be
+            // cleared because it accumulates as we decode.
             byte[] propertiesUpdated = _incomingMask;
             Array.Clear(_decodedMask, 0, byteCount);
 
-            for (int i = 0; i < byteCount; i++)
+            if (!PresenceMask.Decode(buffer, propertiesUpdated.AsSpan(0, byteCount)))
             {
-                propertiesUpdated[i] = NetReader.ReadByte(buffer);
+                // Unlike a bad age byte (consumed either way, so parsing can continue and
+                // discard), a header naming a byte beyond the mask leaves the stream
+                // unalignable. Throwing lands in ImportState's per-serializer catch, which
+                // logs with node context and aborts the tick import un-acked.
+                throw new InvalidOperationException(
+                    $"NetId={network.NetId} corrupt presence-mask header for a {byteCount}-byte mask; the section cannot be realigned.");
             }
 
             // ============================================================
@@ -2070,7 +2090,16 @@ namespace Nebula.Serialization.Serializers
             // (initial sync, per-peer overrides, lossy settles, existing pending bits)
             // re-derive next tick, so over-merging them here is harmless. Object props
             // keep their own resumable per-peer state and need nothing.
-            if (maxBytes < byteCount + AGE_HEADER_BYTES + MIN_PROPERTY_WRITE_BYTES)
+            //
+            // Measured against the RESERVED mask width (worst case), as is every budget
+            // check below. The compact width is unknowable until the mask is final: an
+            // object write later in this call can set a bit in a mask byte the primitives
+            // left empty, so any estimate taken here could still grow, and a section that
+            // ends over maxBytes is dropped by the host after the memo stamps and chunk
+            // frontiers have already advanced. The pessimism is bounded (reserved minus
+            // compact, at most 7 bytes for a 64-prop scene) and only ever defers a tail
+            // node one tick earlier; it can never make a section unshippable.
+            if (maxBytes < _reservedMaskBytes + AGE_HEADER_BYTES + MIN_PROPERTY_WRITE_BYTES)
             {
                 for (var i = 0; i < byteCount; i++)
                 {
@@ -2171,9 +2200,13 @@ namespace Nebula.Serialization.Serializers
             // RESERVE-AND-BACKFILL PATTERN
             // ============================================================
 
-            // Reserve space for the mask (we'll backfill it after writing properties)
+            // Reserve the mask's WORST-CASE width; the backfill writes the compact encoding
+            // and shifts the body down over any slack. Everything below that measures the
+            // section (`WritePosition - maskStartPos`) sees the reserved width, which is the
+            // conservative side of every budget decision.
             int maskStartPos = buffer.WritePosition;
-            for (var i = 0; i < byteCount; i++)
+            int reservedMaskBytes = _reservedMaskBytes;
+            for (var i = 0; i < reservedMaskBytes; i++)
             {
                 NetWriter.WriteByte(buffer, 0); // Placeholder
             }
@@ -2207,7 +2240,7 @@ namespace Nebula.Serialization.Serializers
                     if (candidate.MaskSig == writtenPrimMask
                         && candidate.UseDeltaSig == useDeltaMask
                         && candidate.Age == (byte)baselineAge
-                        && byteCount + candidate.BlobLen <= maxBytes)
+                        && reservedMaskBytes + candidate.BlobLen <= maxBytes)
                     {
                         memoHit = m;
                         break;
@@ -2355,16 +2388,16 @@ namespace Nebula.Serialization.Serializers
                     // missed an input, which is the one failure mode this cache cannot
                     // afford - latch the memo off for the whole run and say so loudly.
                     ref var verifyEntry = ref _memo[memoHit];
-                    int writtenLen = buffer.WritePosition - (maskStartPos + byteCount);
+                    int writtenLen = buffer.WritePosition - (maskStartPos + reservedMaskBytes);
                     bool identical = writtenLen == verifyEntry.BlobLen
-                        && buffer.RawBuffer.AsSpan(maskStartPos + byteCount, writtenLen)
+                        && buffer.RawBuffer.AsSpan(maskStartPos + reservedMaskBytes, writtenLen)
                             .SequenceEqual(verifyEntry.Blob.AsSpan(0, verifyEntry.BlobLen));
                     if (!identical)
                     {
                         _memoDisabled = true;
                         Debugger.Instance.Log(
                             $"[MemoVerify] DIVERGENCE on {_cachedSceneFilePath}: sig=(mask={writtenPrimMask:X}, delta={useDeltaMask:X}, age={baselineAge}) "
-                            + $"slow={Convert.ToHexString(buffer.RawBuffer.AsSpan(maskStartPos + byteCount, writtenLen))} "
+                            + $"slow={Convert.ToHexString(buffer.RawBuffer.AsSpan(maskStartPos + reservedMaskBytes, writtenLen))} "
                             + $"memo={Convert.ToHexString(verifyEntry.Blob.AsSpan(0, verifyEntry.BlobLen))}. "
                             + "Section memo disabled for this run; the signature is missing an input.",
                             Debugger.DebugLevel.ERROR);
@@ -2387,12 +2420,12 @@ namespace Nebula.Serialization.Serializers
                         slot.MaskSig = writtenPrimMask;
                         slot.UseDeltaSig = useDeltaMask;
                         slot.Age = (byte)baselineAge;
-                        int blobLen = buffer.WritePosition - (maskStartPos + byteCount);
+                        int blobLen = buffer.WritePosition - (maskStartPos + reservedMaskBytes);
                         if (slot.Blob == null || slot.Blob.Length < blobLen)
                         {
                             slot.Blob = new byte[Math.Max(blobLen, 256)];
                         }
-                        buffer.RawBuffer.AsSpan(maskStartPos + byteCount, blobLen).CopyTo(slot.Blob);
+                        buffer.RawBuffer.AsSpan(maskStartPos + reservedMaskBytes, blobLen).CopyTo(slot.Blob);
                         slot.BlobLen = blobLen;
                         slot.LossyResultMask = lossyResultBits;
                     }
@@ -2549,16 +2582,33 @@ namespace Nebula.Serialization.Serializers
                 return ExportResult.None;
             }
 
-            // BACKFILL: Go back and write the actual mask
-            // We need to overwrite the placeholder bytes we wrote earlier
-            // NetWriter writes at WritePosition, so we save it, set to maskStartPos, write, then restore
+            // BACKFILL: the mask is final now, so encode it compactly over the placeholder.
+            // A wide mask ships as [header][nonzero bytes] (see PresenceMask), which is
+            // usually far narrower than the reserved worst case; the body is then shifted
+            // down over the slack with one overlapping copy (bodies are tens of bytes).
+            // Nothing records an absolute buffer position during the write - object
+            // serializers stamp per-peer frontiers, the memo captured its blob above - so
+            // moving the body is safe. Only the host's TryAppendSection reads the section,
+            // and it reads WritePosition after this returns.
             int endPos = buffer.WritePosition;
-            buffer.WritePosition = maskStartPos;
-            for (var i = 0; i < byteCount; i++)
+            Span<byte> compactMask = stackalloc byte[PresenceMask.HeaderBytes + PresenceMask.MaxMaskBytes];
+            int compactLen = PresenceMask.Encode(actualMask.AsSpan(0, byteCount), compactMask);
+            compactMask.Slice(0, compactLen).CopyTo(buffer.RawBuffer.AsSpan(maskStartPos, compactLen));
+            int maskSlack = reservedMaskBytes - compactLen;
+            if (maskSlack > 0)
             {
-                NetWriter.WriteByte(buffer, actualMask[i]);
+                int bodyStart = maskStartPos + reservedMaskBytes;
+                int bodyLen = endPos - bodyStart;
+                buffer.RawBuffer.AsSpan(bodyStart, bodyLen).CopyTo(buffer.RawBuffer.AsSpan(bodyStart - maskSlack, bodyLen));
+                endPos -= maskSlack;
             }
             buffer.WritePosition = endPos;
+            if (TraceWire)
+            {
+                // The per-property [Props.W] `end=` offsets above are reserved-relative; this
+                // line is what reconciles them against the client's [Props.R] positions.
+                Debugger.Instance.Log($"[Props.W] mask={Convert.ToHexString(compactMask.Slice(0, compactLen))} reserved={reservedMaskBytes} compact={compactLen} sectionLen={endPos - maskStartPos}");
+            }
 
             // Packet-coupled stamps (SentHistory, shipped-bit pending, initial sync,
             // per-peer dirty clears) apply in CommitExport once the host commits these

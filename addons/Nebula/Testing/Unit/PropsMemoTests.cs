@@ -250,23 +250,52 @@ public class PropsMemoTests
     [NebulaUnitTest]
     public void OnOffEquivalence_RandomizedSchedules()
     {
-        var peerId = UUID.NewUUID();
-        using var on = new Fixture(memoOn: true, peerId,
+        RunOnOffEquivalence(
             SerialVariantType.Int, SerialVariantType.Float, SerialVariantType.Int, SerialVariantType.Float);
-        using var off = new Fixture(memoOn: false, peerId,
-            SerialVariantType.Int, SerialVariantType.Float, SerialVariantType.Int, SerialVariantType.Float);
+    }
 
+    // 7b. The same matrix at a WIDE presence mask (24 props = 3 mask bytes, two-level on the
+    //     wire): proves the memo blob and the compacting backfill agree byte-for-byte when
+    //     the mask is being shifted under the body.
+    [NebulaUnitTest]
+    public void OnOffEquivalence_RandomizedSchedules_TwoLevelMask()
+    {
+        var types = new SerialVariantType[24];
+        for (int i = 0; i < types.Length; i++)
+        {
+            types[i] = (i % 3 == 1) ? SerialVariantType.Float : SerialVariantType.Int;
+        }
+        RunOnOffEquivalence(types);
+    }
+
+    private static void RunOnOffEquivalence(params SerialVariantType[] types)
+    {
+        var peerId = UUID.NewUUID();
+        using var on = new Fixture(memoOn: true, peerId, types);
+        using var off = new Fixture(memoOn: false, peerId, types);
+
+        long allProps = types.Length >= 64 ? -1L : (1L << types.Length) - 1;
         var rng = new Random(1234);   // fixed seed: failures must reproduce
         for (int tick = 1; tick <= 40; tick++)
         {
-            long dirty = rng.Next(1, 16);
+            // Sparse-ish dirty sets, like real traffic: each prop dirty with ~1/4 chance,
+            // never empty.
+            long dirty = 0;
+            while (dirty == 0)
+            {
+                for (int prop = 0; prop < types.Length; prop++)
+                {
+                    if (rng.Next(4) == 0) dirty |= 1L << prop;
+                }
+                dirty &= allProps;
+            }
             bool ack = rng.Next(3) == 0;
             float bump = (float)rng.NextDouble();
 
             foreach (var f in new[] { on, off })
             {
                 f.World.CurrentTick = tick;
-                for (int prop = 0; prop < 4; prop++)
+                for (int prop = 0; prop < types.Length; prop++)
                 {
                     if ((dirty & (1L << prop)) == 0) continue;
                     var cache = f.Node.Network.CachedProperties[prop];

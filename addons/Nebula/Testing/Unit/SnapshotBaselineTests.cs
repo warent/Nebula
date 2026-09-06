@@ -13,8 +13,10 @@ namespace Nebula.Testing.Unit;
 /// and a malformed age byte must discard rather than index the ring negatively and throw.
 ///
 /// Built on the Protocol-free test constructor; wire format per payload is
-/// [presence mask x byteCount][baselineAge byte][property data], and these tests use an
-/// empty presence mask so no property bytes follow.
+/// [presence mask][baselineAge byte][property data], where the mask is flat for scenes with
+/// one or two mask bytes (this fixture: 2 props, 1 byte) and two-level ([header][nonzero
+/// bytes], see PresenceMask) for wider ones. These tests use an empty presence mask so no
+/// property bytes follow.
 /// </summary>
 [NebulaUnitTest]
 public class SnapshotBaselineTests
